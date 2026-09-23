@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+# spark-aerc -- the mail you are reading, in the room with spark.
+#
+# aerc pipes the message in (`:pipe -m -s spark-aerc`, the Alt-s line in
+# binds.spark) and hands over a terminal tab; this draws the mail's
+# header on it and asks at `spark> `:
+#
+#   Enter            the overview: `spark read` -- every line quotes
+#                    the mail, or an honest refusal
+#   words, ? words   a conversation: `spark edit ? --source` with a
+#                    thread, so follow-ups ride the earlier turns
+#   q, Ctrl-D        back to aerc (the tab closes); Ctrl-C is never mind
+#
+# --draft is the compose review screen's mode: the same loop on your own
+# draft, without --source (the author's review; Enter = `spark edit ?`).
+#
+# What leaves: the body (plain, or html turned to text) and your words
+# on stdin/argv of one `spark` call, the subject as a name (60 chars at
+# most). Never an address, a To/Cc, the Message-ID (only a hash of it
+# names the thread), an attachment, a draft's quoted lines or a token.
+# The question rides after `--`, never as a flag. This wrapper never
+# speaks HTTP and never hands mail text to a shell. spark 1.46 holds a
+# source's secret-shaped spans back (a one-time code, a reset link)
+# before it leaves; this wrapper refuses an older spark.
+#
+# python3 stdlib, 3.9 or newer.
+
+import codecs
+import email
+import email.policy
+import hashlib
+import html.parser
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import termios
+import textwrap
+import threading
+import time
+import unicodedata
+
+NEED = ("spark-aerc needs spark 1.46 or newer (it holds a mail's secrets "
+        "back) -- spark update")
+MISSING = ("spark-aerc needs spark 1.46 or newer on this machine (it holds "
+           "a mail's secrets back) -- spark.forgewright.ai")
+QUIT = ("q", "/q", "/quit", "/exit", ":q", ":quit", ":wq", "quit", "exit", "bye")
+NAME_MAX = 60
+READ_MAX = 16000        # spark read's part: a longer mail is read in parts
+PART_STRIDE = 15600     # a part's start moves by this (16000 less the overlap)
+PART_ROOM = 15000       # past this, ask for part 1 outright: a held span
+                        # can lengthen the text a little
+BOLD, DIM, RESET = "\033[1m", "\033[36m", "\033[0m"
+
+
+# --- text that reaches the screen or spark --------------------------------
+
+def inert(s):
+    """A header for the screen: every control and format character gone
+    (C0, DEL, C1, ESC, bidi overrides), whitespace folded to one space.
+    A subject can carry terminal escapes; on this screen they are text."""
+    out = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if ch in "\t\r\n":
+            out.append(" ")
+        elif cat in ("Cc", "Cf"):
+            continue
+        else:
+            out.append(ch)
+    return " ".join("".join(out).split())
+
+
+def clean_body(s):
+    """The body for spark: line ends made \\n, every control character
+    but tab and newline dropped (so no escape reaches the model, or comes
+    back out of it onto this screen)."""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(ch for ch in s if ch in "\t\n" or unicodedata.category(ch) != "Cc")
+
+
+def clean_answer(s):
+    """spark's answer, before the screen: controls and format characters
+    (bidi overrides too) dropped, so a quote of a hostile mail cannot
+    drive the terminal or turn its text around."""
+    return "".join(ch for ch in s if ch in "\t\n" or unicodedata.category(ch) not in ("Cc", "Cf"))
+
+
+def name_of(subject):
+    """The subject as spark's --name: inert, no slash (spark keeps a
+    name's basename), at most NAME_MAX chars."""
+    n = inert(subject).replace("/", "-").replace("\\", "-")
+    if len(n) > NAME_MAX:
+        n = n[:NAME_MAX].rstrip()
+    return n
+
+
+class _Text(html.parser.HTMLParser):
+    """html to readable text: script and style dropped, a new line at
+    each block, entities decoded."""
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+             "blockquote", "pre", "table", "ul", "ol", "hr", "section", "article"}
+
+    def __init__(self):
+        html.parser.HTMLParser.__init__(self, convert_charrefs=True)
+        self.out, self.skip = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head", "title"):
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head", "title"):
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.out.append(data)
+
+    def text(self):
+        lines = [" ".join(l.split()) for l in "".join(self.out).split("\n")]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
+
+
+def html_text(s):
+    p = _Text()
+    try:
+        p.feed(s)
+        p.close()
+    except Exception:
+        return re.sub(r"<[^>]*>", " ", s)
+    return p.text()
+
+
+def part_text(part):
+    try:
+        s = part.get_content()
+    except Exception:
+        raw = part.get_payload(decode=True) or b""
+        s = raw.decode("utf-8", "replace")
+    if not isinstance(s, str):
+        s = s.decode("utf-8", "replace") if isinstance(s, bytes) else ""
+    if part.get_content_type() == "text/html":
+        s = html_text(s)
+    return s
+
+
+QUOTED = re.compile(r"^[ \t]*>")
+WROTE = re.compile(r"wrote:\s*$")
+
+
+def own_lines(text):
+    """A draft without the lines it quotes: `>` lines are someone else's
+    text, and so is the "... wrote:" line that opens them. (text,
+    dropped) -- dropped is how many lines stayed here."""
+    lines = text.split("\n")
+    keep, dropped = [], 0
+    for i, line in enumerate(lines):
+        quoted = QUOTED.match(line)
+        opens = WROTE.search(line) and any(QUOTED.match(l) for l in lines[i + 1:i + 3] if l.strip())
+        if quoted or opens:
+            dropped += 1
+        else:
+            keep.append(line)
+    return "\n".join(keep), dropped
+
+
+def parts_of(n):
+    """How many parts spark read makes of n chars (its own arithmetic)."""
+    return 1 if n <= READ_MAX else 1 + -(-(n - READ_MAX) // PART_STRIDE)
+
+
+def header(msg, key):
+    try:
+        return str(msg.get(key, "") or "")
+    except Exception:
+        return ""
+
+
+def parse(data):
+    """(body, subject, sender, date, attachments, message_id) from the
+    piped bytes. No mail headers: the text as is."""
+    msg = email.message_from_bytes(data, policy=email.policy.default)
+    if not any(k in msg for k in ("From", "Subject", "Date", "Message-ID", "Content-Type", "To")):
+        return clean_body(data.decode("utf-8", "replace")), "", "", "", 0, ""
+    body = None
+    try:
+        body = msg.get_body(preferencelist=("plain", "html"))
+    except Exception:
+        body = None
+    text = part_text(body) if body is not None else ""
+    n = 0
+    for p in msg.walk():
+        if p.is_multipart() or p is body:
+            continue
+        if p.get_content_disposition() == "attachment" or p.get_filename():
+            n += 1
+    return (clean_body(text), header(msg, "Subject"), header(msg, "From"),
+            header(msg, "Date"), n, header(msg, "Message-ID").strip())
+
+
+# --- the terminal aerc hands over -----------------------------------------
+
+class Tty:
+    def __init__(self):
+        self.fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        try:
+            self.saved = termios.tcgetattr(self.fd)
+        except termios.error:
+            self.saved = None
+        if self.saved:
+            a = termios.tcgetattr(self.fd)
+            a[0] |= termios.ICRNL
+            a[1] |= termios.OPOST | termios.ONLCR
+            a[3] |= termios.ICANON | termios.ECHO | termios.ISIG
+            termios.tcsetattr(self.fd, termios.TCSANOW, a)
+        self.lock = threading.Lock()
+
+    def write(self, s):
+        with self.lock:
+            data = s.encode("utf-8", "replace")
+            while data:
+                n = os.write(self.fd, data)
+                data = data[n:]
+
+    def line(self):
+        """One line from the keyboard; None on Ctrl-D."""
+        data = os.read(self.fd, 4096)
+        if not data:
+            return None
+        return data.decode("utf-8", "replace").rstrip("\r\n")
+
+    def key(self):
+        """Wait for one key, whatever it is."""
+        if not self.saved:
+            os.read(self.fd, 1)
+            return
+        a = termios.tcgetattr(self.fd)
+        a[3] &= ~(termios.ICANON | termios.ECHO)
+        a[6][termios.VMIN], a[6][termios.VTIME] = 1, 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, a)
+        try:
+            os.read(self.fd, 16)
+        finally:
+            a[3] |= termios.ICANON | termios.ECHO
+            termios.tcsetattr(self.fd, termios.TCSANOW, a)
+
+    def width(self):
+        try:
+            cols = os.get_terminal_size(self.fd).columns
+        except OSError:
+            cols = 80
+        w = cols - 2
+        return 100 if w > 100 else (78 if w < 40 else w)
+
+    def restore(self):
+        if self.saved:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+            except termios.error:
+                pass
+
+
+class Pulse:
+    """The wait says what it is until the first byte of the answer."""
+
+    def __init__(self, tty, what):
+        self.tty, self.what, self.stop_ = tty, what, threading.Event()
+        self.t = threading.Thread(target=self.run)
+        self.t.daemon = True
+        self.t.start()
+
+    def run(self):
+        t0, n = time.time(), 0
+        while not self.stop_.wait(0.25 if n else 0):
+            self.tty.write("\r\033[2K%s  %s %ds" % (self.what, "|/-\\"[n % 4], int(time.time() - t0)))
+            n += 1
+
+    def stop(self):
+        if not self.stop_.is_set():
+            self.stop_.set()
+            self.t.join()
+            self.tty.write("\r\033[2K")
+
+
+def has_reveal():
+    try:
+        return subprocess.run(["spark", "reveal", "-h"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def answer(tty, argv, body, what, reveal):
+    """One call to spark: the body on stdin, stderr folded into the
+    answer (a refusal shows), each line cleaned and wrapped."""
+    pulse = Pulse(tty, what)
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+    except OSError as e:
+        pulse.stop()
+        tty.write("spark-aerc: %s\n" % inert(str(e)))
+        return
+
+    def feed():
+        try:
+            p.stdin.write(body.encode("utf-8"))
+        except (OSError, ValueError):
+            pass
+        try:
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+    threading.Thread(target=feed, daemon=True).start()
+    show = None
+    if reveal:
+        try:
+            show = subprocess.Popen(["spark", "reveal"], stdin=subprocess.PIPE,
+                                    stdout=tty.fd, stderr=tty.fd)
+        except OSError:
+            show = None
+    width = tty.width()
+    pending = ""
+    decode = codecs.getincrementaldecoder("utf-8")("replace").decode
+
+    def out(line):
+        if len(line) > width:
+            line = "\n".join(textwrap.wrap(line, width, break_on_hyphens=False)) or line
+        text = line + "\n"
+        if show:
+            try:
+                show.stdin.write(text.encode("utf-8"))
+                show.stdin.flush()
+                return
+            except OSError:
+                pass
+        tty.write(text)
+    try:
+        first = True
+        while True:
+            chunk = os.read(p.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            if first:
+                pulse.stop()
+                first = False
+            pending += clean_answer(decode(chunk))
+            while "\n" in pending:
+                line, pending = pending.split("\n", 1)
+                out(line)
+        pulse.stop()
+        pending += clean_answer(decode(b"", True))
+        if pending:
+            out(pending)
+    finally:
+        pulse.stop()
+        p.wait()
+        if show:
+            try:
+                show.stdin.close()
+            except OSError:
+                pass
+            show.wait()
+
+
+def refuse(tty, why):
+    tty.write("%s\n\n(a key returns to aerc)" % why)
+    tty.key()
+
+
+def ready():
+    """None when this spark holds a source's secrets back, else the line
+    that says why not."""
+    if not shutil.which("spark"):
+        return MISSING
+    try:
+        p = subprocess.run(["spark", "edit", "-h"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return NEED
+    return None if b"held back" in p.stdout else NEED
+
+
+USAGE = """spark-aerc -- ask the mail you are reading (aerc runs it on Alt-s)
+
+  :pipe -m -s spark-aerc           a mail on stdin: its header, then spark>
+  :pipe -s spark-aerc --draft      your draft, from the review screen
+
+  binds.spark has the three lines; README.md has the install.
+"""
+
+
+def main(argv):
+    draft = "--draft" in argv[1:]
+    if any(a in ("-h", "--help", "help") for a in argv[1:]) or sys.stdin.isatty():
+        sys.stderr.write(USAGE)
+        return 2
+    data = sys.stdin.buffer.read()
+    try:
+        tty = Tty()
+    except OSError:
+        sys.stderr.write("spark-aerc: no terminal -- aerc runs it with :pipe -s\n")
+        return 2
+    try:
+        tty.write("\033[?1049h\033[2J\033[H")
+        why = ready()
+        if why:
+            refuse(tty, why)
+            return 1
+        body, subject, sender, date, attached, mid = parse(data)
+        name = name_of(subject)
+        dropped = 0
+        if draft:
+            body, dropped = own_lines(body)
+        # the same mail continues its thread: a hash of its Message-ID
+        # (nothing of the id leaves); a draft, or a mail without one, gets
+        # a fresh thread -- never a hash of the text
+        if mid and not draft:
+            thread = "aerc-" + hashlib.sha256(mid.encode("utf-8", "replace")).hexdigest()[:16]
+        else:
+            thread = "aerc-" + secrets.token_hex(8)
+        width = tty.width()
+        if draft:
+            tty.write("%syour draft%s%s\n" % (BOLD, (": " + inert(subject)) if subject else "", RESET))
+        else:
+            tty.write("%s%s%s\n" % (BOLD, inert(subject) or "(no subject)", RESET))
+            if sender:
+                tty.write("%sFrom: %s%s\n" % (DIM, inert(sender), RESET))
+            if date:
+                tty.write("%sDate: %s%s\n" % (DIM, inert(date), RESET))
+        if attached:
+            tty.write("%s%d attachment%s, not read%s\n" % (DIM, attached, "" if attached == 1 else "s", RESET))
+        tty.write("-" * width + "\n")
+        if not body.strip():
+            refuse(tty, "this %s has no text to read" % ("draft" if draft else "mail"))
+            return 0
+        if dropped:
+            tty.write("quoted lines stay here (%d): spark sees your own text\n" % dropped)
+        parts = parts_of(len(body))
+        if parts > 1 and not draft:
+            tty.write("a long mail: the overview reads part 1 of %d\n" % parts)
+        if draft:
+            tty.write("Enter: a review   words: ask about it   q: back to aerc\n\n")
+        else:
+            tty.write("Enter: the overview   words: ask the mail   q: back to aerc\n\n")
+        reveal = has_reveal()
+        asked = False
+        while True:
+            tty.write("%sspark>%s " % (BOLD, RESET))
+            q = tty.line()
+            if q is None:
+                break
+            q = q.strip()
+            if q in QUIT:
+                break
+            if not q and asked:
+                break
+            if q.startswith("?"):
+                q = q[1:].strip()
+            # the flags first, the question last, after `--`: words are
+            # never options (a question that is `--decline` or `--type`
+            # must not become one), and a leading dash is spaced off too
+            if q.startswith("-"):
+                q = " " + q
+            if draft:
+                call = ["spark", "edit", "?", "--thread", thread, "--about", "an e-mail draft"]
+            elif not q:
+                call = ["spark", "read"]
+                if len(body) > PART_ROOM:
+                    call += ["--part", "1"]
+            else:
+                call = ["spark", "edit", "?", "--source", "--thread", thread,
+                        "--about", "an e-mail"]
+            if name:
+                call += ["--name", name]
+            if q:
+                call += ["--", q]
+            tty.write("\n")
+            what = "thinking" if asked else "reading %d characters" % len(body)
+            answer(tty, call, body, what, reveal)
+            tty.write("\n")
+            asked = True
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        tty.write("\033[?1049l")
+        tty.restore()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

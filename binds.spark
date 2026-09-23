@@ -1,0 +1,29 @@
+# spark in aerc -- your own AI, on your own machine (spark.forgewright.ai).
+# Append this to the end of your aerc binds.conf (README.md, Install):
+#
+#     cat ~/.local/share/spark-aerc/binds.spark >> binds.conf
+#
+# aerc merges a section named twice, so its own keys stay as they are.
+# Alt-s on a mail (in the list, or open) pipes it to spark-aerc on a
+# terminal tab: its header, then spark>
+#
+#   Enter        the overview: every line quotes the mail
+#   words        ask the mail; follow-ups ride the same thread
+#   q            back to aerc (Ctrl-D too); Ctrl-C is never mind
+#
+# Alt-s on the review screen (after you write, before you send) asks
+# about your own draft: Enter is a review, words ask.
+#
+# What leaves this machine: the mail's text and your words, the subject
+# as a name, to the AI spark is set up for. spark holds spans that look
+# like secrets back first (a one-time code, a reset link). Never the
+# addresses in the headers, an attachment, or the Message-ID; your own
+# draft's quoted lines stay here too.
+#
+# Needs aerc 0.18 or newer (proven on 0.22) and spark 1.46 or newer.
+[messages]
+<A-s> = :pipe -m -s spark-aerc<Enter>
+[view]
+<A-s> = :pipe -m -s spark-aerc<Enter>
+[compose::review]
+<A-s> = :pipe -s spark-aerc --draft<Enter> # spark
